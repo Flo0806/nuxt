@@ -71,8 +71,14 @@ export default defineNuxtModule<ComponentsOptions>({
     nuxt.hook('app:resolve', async () => {
       // components/ dirs from all layers
       const allDirs: ComponentsDir[] = []
-      for (const layer of nuxt.options._layers) {
-        const layerDirs = normalizeDirs(layer.config.components, layer.config.srcDir, { priority: layer.config.srcDir === nuxt.options.srcDir ? 1 : 0 })
+      // Assign priority based on layer order - later layers (higher index) get higher priority
+      // This ensures that components from layers appearing later in 'extends' override earlier ones
+      for (let i = 0; i < nuxt.options._layers.length; i++) {
+        const layer = nuxt.options._layers[i]
+        // Root layer gets highest priority (10), other layers get priority based on their index
+        // Higher index = higher priority, so later extends override earlier ones
+        const priority = layer.config.srcDir === nuxt.options.srcDir ? 10 : i
+        const layerDirs = normalizeDirs(layer.config.components, layer.config.srcDir, { priority })
         allDirs.push(...layerDirs)
       }
 

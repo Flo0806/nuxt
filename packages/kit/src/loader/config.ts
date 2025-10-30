@@ -30,7 +30,7 @@ export async function loadNuxtConfig (opts: LoadNuxtConfigOptions): Promise<Nuxt
     onlyDirectories: true, cwd: opts.cwd || process.cwd(),
   }))
     .map((d: string) => d.endsWith('/') ? d.substring(0, d.length - 1) : d)
-    .sort((a, b) => b.localeCompare(a))
+    .sort((a, b) => a.localeCompare(b))
   opts.overrides = defu(opts.overrides, { _extends: localLayers })
 
   const { configFile, layers = [], cwd, config: nuxtConfig, meta } = await withDefineNuxtConfig(
@@ -38,7 +38,7 @@ export async function loadNuxtConfig (opts: LoadNuxtConfigOptions): Promise<Nuxt
       name: 'nuxt',
       configFile: 'nuxt.config',
       rcFile: '.nuxtrc',
-      extend: { extendKey: ['theme', '_extends', 'extends'] },
+      extend: { extendKey: ['theme', 'extends', '_extends'] },
       dotenv: true,
       globalRc: true,
       // @ts-expect-error TODO: fix type in c12, it should accept createDefu directly
@@ -106,7 +106,7 @@ export async function loadNuxtConfig (opts: LoadNuxtConfigOptions): Promise<Nuxt
     _layers.push(layer)
   }
 
-  ;(nuxtConfig as any)._layers = _layers
+  ;(nuxtConfig as any)._layers = _layers.reverse()
 
   // Ensure at least one layer remains (without nuxt.config)
   if (!_layers.length) {
