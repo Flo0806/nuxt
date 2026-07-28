@@ -1,13 +1,12 @@
 import { mkdir, open, readFile, stat, unlink, writeFile } from 'node:fs/promises'
 import type { FileHandle } from 'node:fs/promises'
-import { resolve } from 'node:path'
 import { existsSync } from 'node:fs'
-import { createIsIgnored } from '@nuxt/kit'
+import { buildDiagnostics, createIsIgnored } from '@nuxt/kit'
 import type { Nuxt, NuxtConfig, NuxtConfigLayer } from '@nuxt/schema'
 import { hash, serialize } from 'ohash'
 import { glob } from 'tinyglobby'
 import { consola } from 'consola'
-import { dirname, join, relative } from 'pathe'
+import { dirname, join, relative, resolve } from 'pathe'
 import { createTar, parseTar } from 'nanotar'
 import type { TarFileInput } from 'nanotar'
 
@@ -16,15 +15,17 @@ export async function getVueHash (nuxt: Nuxt) {
 
   const { hash } = await getHashes(nuxt, {
     id,
-    cwd: layer => layer.config?.srcDir,
-    patterns: layer => [
-      join(relative(layer.cwd, layer.config.srcDir), '**'),
-      `!${relative(layer.cwd, layer.config.serverDir || join(layer.cwd, 'server'))}/**`,
-      `!${relative(layer.cwd, resolve(layer.config.srcDir || layer.cwd, layer.config.dir?.public || 'public'))}/**`,
-      `!${relative(layer.cwd, resolve(layer.config.srcDir || layer.cwd, layer.config.dir?.static || 'public'))}/**`,
-      '!node_modules/**',
-      '!nuxt.config.*',
-    ],
+    cwd: layer => layer.config.srcDir || layer.cwd,
+    patterns: (layer) => {
+      const srcDir = layer.config.srcDir || layer.cwd
+      return [
+        '**',
+        `!${relative(srcDir, layer.config.serverDir || join(layer.cwd, 'server'))}/**`,
+        `!${relative(srcDir, resolve(layer.cwd, layer.config.dir?.public || 'public'))}/**`,
+        '!node_modules/**',
+        '!nuxt.config.*',
+      ]
+    },
     configOverrides: {
       buildId: undefined,
       serverDir: undefined,
@@ -33,24 +34,29 @@ export async function getVueHash (nuxt: Nuxt) {
       runtimeConfig: undefined,
       logLevel: undefined,
       devServerHandlers: undefined,
-      generate: undefined,
       devtools: undefined,
     },
   })
 
   const cacheFile = join(getCacheDir(nuxt), id, hash + '.tar')
+  const buildIdCacheFile = cacheFile.replace('.tar', '.buildid')
 
   return {
     hash,
     async collectCache () {
       const start = Date.now()
       await writeCache(nuxt.options.buildDir, nuxt.options.buildDir, cacheFile)
+
+      // Cache buildId so it can be restored before modules are initialised on the next build
+      await mkdir(dirname(buildIdCacheFile), { recursive: true })
+      await writeFile(buildIdCacheFile, nuxt.options.buildId)
+
       const elapsed = Date.now() - start
       consola.success(`Cached Vue client and server builds in \`${elapsed}ms\`.`)
     },
     async restoreCache () {
       const start = Date.now()
-      const res = await restoreCache(nuxt.options.buildDir, cacheFile)
+      const res = await restoreCacheFromFile(nuxt.options.buildDir, cacheFile)
       const elapsed = Date.now() - start
       if (res) {
         consola.success(`Restored Vue client and server builds from cache in \`${elapsed}ms\`.`)
@@ -60,9 +66,36 @@ export async function getVueHash (nuxt: Nuxt) {
   }
 }
 
+/**
+ * Restore cached buildId before modules are initialised.
+ *
+ * Modules and the nitro builder require `buildId`, so we must set
+ * `nuxt.options.buildId` and `nuxt.options.runtimeConfig.app.buildId`
+ * before modules install. This ensures the manifest and all downstream
+ * consumers use the same buildId that was used when the Vue build was cached.
+ */
+export async function restoreCachedBuildId (nuxt: Nuxt) {
+  const { hash } = await getVueHash(nuxt)
+  const cacheDir = getCacheDir(nuxt)
+  const buildIdCacheFile = join(cacheDir, 'vue', hash + '.buildid')
+
+  if (!existsSync(buildIdCacheFile)) {
+    return
+  }
+
+  const cachedBuildId = (await readFile(buildIdCacheFile, 'utf-8')).trim()
+  if (!cachedBuildId || !/^[\w-]+$/.test(cachedBuildId)) {
+    return
+  }
+
+  nuxt.options.buildId = cachedBuildId
+  nuxt.options.runtimeConfig.app.buildId = cachedBuildId
+  consola.debug(`Restored cached buildId: ${cachedBuildId}`)
+}
+
 export async function cleanupCaches (nuxt: Nuxt) {
   const start = Date.now()
-  const caches = await glob(['*/*.tar'], {
+  const caches = await glob(['*/*.tar', '*/*.buildid'], {
     cwd: getCacheDir(nuxt),
     absolute: true,
   })
@@ -142,6 +175,7 @@ async function getHashes (nuxt: Nuxt, options: GetHashOptions): Promise<Hashes> 
         'yarn.lock',
         'pnpm-lock.yaml',
         'tsconfig.json',
+        'bun.lock',
         'bun.lockb',
       ],
     })
@@ -213,10 +247,12 @@ async function readFileWithMeta (dir: string, fileName: string, count = 0): Prom
 
     // retry if file has changed during read
     if ((await fd.stat()).mtime.getTime() !== mtime) {
+      await fd.close()
+      fd = undefined
       if (count < 5) {
-        return readFileWithMeta(dir, fileName, count + 1)
+        return await readFileWithMeta(dir, fileName, count + 1)
       }
-      console.warn(`Failed to read file \`${fileName}\` as it changed during read.`)
+      buildDiagnostics.NUXT_B1010({ file: fileName })
       return
     }
 
@@ -229,37 +265,47 @@ async function readFileWithMeta (dir: string, fileName: string, count = 0): Prom
       },
     }
   } catch (err) {
-    console.warn(`Failed to read file \`${fileName}\`:`, err)
+    buildDiagnostics.NUXT_B1011({ file: fileName, cause: err })
   } finally {
     await fd?.close()
   }
 }
 
-async function restoreCache (cwd: string, cacheFile: string) {
+async function restoreCacheFromFile (cwd: string, cacheFile: string) {
   if (!existsSync(cacheFile)) {
     return false
   }
 
+  const resolvedCwd = resolve(cwd) + '/'
   const files = parseTar(await readFile(cacheFile))
   for (const file of files) {
     let fd: FileHandle | undefined = undefined
     try {
       const filePath = resolve(cwd, file.name)
+
+      // Prevent path traversal attacks
+      if (!filePath.startsWith(resolvedCwd)) {
+        buildDiagnostics.NUXT_B1012({ path: file.name })
+        continue
+      }
+
       await mkdir(dirname(filePath), { recursive: true })
 
-      fd = await open(filePath, 'w')
-
-      const stats = await fd.stat().catch(() => null)
-      if (stats?.isFile() && stats.size) {
+      // Stat before open('w') since it truncates the file
+      const existingStats = await stat(filePath).catch(() => null)
+      const cachedSize = file.data?.byteLength ?? 0
+      if (existingStats?.isFile() && existingStats.size === cachedSize) {
         const lastModified = Number.parseInt(file.attrs?.mtime?.toString().padEnd(13, '0') || '0')
-        if (stats.mtime.getTime() >= lastModified) {
+        if (existingStats.mtime.getTime() >= lastModified) {
           consola.debug(`Skipping \`${file.name}\` (up to date or newer than cache)`)
           continue
         }
       }
+
+      fd = await open(filePath, 'w')
       await fd.writeFile(file.data!)
     } catch (err) {
-      console.error(err)
+      buildDiagnostics.NUXT_B1013({ file: file.name, cause: err })
     } finally {
       await fd?.close()
     }
@@ -280,7 +326,7 @@ async function writeCache (cwd: string, sources: string | string[], cacheFile: s
 function getCacheDir (nuxt: Nuxt) {
   let cacheDir = join(nuxt.options.workspaceDir, 'node_modules')
   if (!existsSync(cacheDir)) {
-    for (const dir of [...nuxt.options.modulesDir].sort((a, b) => a.length - b.length)) {
+    for (const dir of nuxt.options.modulesDir.toSorted((a, b) => a.length - b.length)) {
       if (existsSync(dir)) {
         cacheDir = dir
         break

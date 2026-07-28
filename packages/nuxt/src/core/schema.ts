@@ -1,16 +1,15 @@
 import { existsSync } from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
-import { resolve } from 'pathe'
+import { join, relative, resolve } from 'pathe'
 import { watch } from 'chokidar'
 import { defu } from 'defu'
 import { debounce } from 'perfect-debounce'
-import { createIsIgnored, createResolver, defineNuxtModule, directoryToURL, importModule } from '@nuxt/kit'
+import { configDiagnostics, createIsIgnored, createResolver, defineNuxtModule, directoryToURL, getAddDependencyCommand, getLayerDirectories, importModule } from '@nuxt/kit'
 import { generateTypes, resolveSchema as resolveUntypedSchema } from 'untyped'
 import type { Schema, SchemaDefinition } from 'untyped'
 import untypedPlugin from 'untyped/babel-plugin'
 import { createJiti } from 'jiti'
-import { logger } from '../utils'
 
 export default defineNuxtModule({
   meta: {
@@ -21,7 +20,7 @@ export default defineNuxtModule({
 
     // Initialize untyped/jiti loader
     const _resolveSchema = createJiti(fileURLToPath(import.meta.url), {
-      cache: false,
+      fsCache: false,
       transformOptions: {
         babel: {
           plugins: [untypedPlugin],
@@ -32,9 +31,22 @@ export default defineNuxtModule({
     // Register module types
     nuxt.hook('prepare:types', async (ctx) => {
       ctx.references.push({ path: 'schema/nuxt.schema.d.ts' })
+      ctx.sharedReferences.push({ path: 'schema/nuxt.schema.d.ts' })
+      ctx.nodeReferences.push({ path: 'schema/nuxt.schema.d.ts' })
+
+      ctx.nodeTsConfig.include ||= []
+      ctx.nodeTsConfig.include.push(
+        relative(nuxt.options.buildDir, join(nuxt.options.rootDir, 'nuxt.schema.*')),
+        relative(nuxt.options.buildDir, join(nuxt.options.rootDir, 'layers/*/nuxt.schema.*')),
+      )
+
       if (nuxt.options._prepare) {
         await writeSchema(schema)
       }
+    })
+
+    nuxt.hook('nitro:prepare:types', (ctx) => {
+      ctx.references.push({ path: resolve(nuxt.options.buildDir, 'schema/nuxt.schema.d.ts') })
     })
 
     // Resolve schema after all modules initialized
@@ -45,6 +57,8 @@ export default defineNuxtModule({
 
     // Write schema after build to allow further modifications
     nuxt.hooks.hook('build:done', () => writeSchema(schema))
+
+    const layerDirs = getLayerDirectories(nuxt)
 
     // Watch for schema changes in development mode
     if (nuxt.options.dev) {
@@ -58,22 +72,22 @@ export default defineNuxtModule({
           const { subscribe } = await importModule<typeof import('@parcel/watcher')>('@parcel/watcher', {
             url: [nuxt.options.rootDir, ...nuxt.options.modulesDir].map(dir => directoryToURL(dir)),
           })
-          for (const layer of nuxt.options._layers) {
-            const subscription = await subscribe(layer.config.rootDir, onChange, {
+          for (const dirs of layerDirs) {
+            const subscription = await subscribe(dirs.root, onChange, {
               ignore: ['!nuxt.schema.*'],
             })
             nuxt.hook('close', () => subscription.unsubscribe())
           }
           return
         } catch {
-          logger.warn('Falling back to `chokidar` as `@parcel/watcher` cannot be resolved in your project.')
+          configDiagnostics.NUXT_B5009({ installCommand: await getAddDependencyCommand('@parcel/watcher', nuxt.options.rootDir, { dev: true }) })
         }
       }
 
       const isIgnored = createIsIgnored(nuxt)
-      const dirsToWatch = nuxt.options._layers.map(layer => resolver.resolve(layer.config.rootDir))
+      const rootDirs = layerDirs.map(layer => layer.root)
       const SCHEMA_RE = /(?:^|\/)nuxt.schema.\w+$/
-      const watcher = watch(dirsToWatch, {
+      const watcher = watch(rootDirs, {
         ...nuxt.options.watchers.chokidar,
         depth: 1,
         ignored: [
@@ -96,19 +110,15 @@ export default defineNuxtModule({
 
       // Load schema from layers
       const schemaDefs: SchemaDefinition[] = [nuxt.options.$schema]
-      for (const layer of nuxt.options._layers) {
-        const filePath = await resolver.resolvePath(resolve(layer.config.rootDir, 'nuxt.schema'))
+      for (const dirs of layerDirs) {
+        const filePath = await resolver.resolvePath(join(dirs.root, 'nuxt.schema'))
         if (filePath && existsSync(filePath)) {
           let loadedConfig: SchemaDefinition
           try {
             // TODO: fix type for second argument of `import`
             loadedConfig = await _resolveSchema.import(filePath, { default: true }) as SchemaDefinition
           } catch (err) {
-            logger.warn(
-              'Unable to load schema from',
-              filePath,
-              err,
-            )
+            configDiagnostics.NUXT_B5005({ filePath, cause: err })
             continue
           }
           schemaDefs.push(loadedConfig)
@@ -165,10 +175,7 @@ declare module 'nuxt/schema' {
   interface CustomAppConfig extends _CustomAppConfig {}
 }
 `
-      const typesPath = resolve(
-        nuxt.options.buildDir,
-        'schema/nuxt.schema.d.ts',
-      )
+      const typesPath = resolve(nuxt.options.buildDir, 'schema/nuxt.schema.d.ts')
       await writeFile(typesPath, types, 'utf8')
       await nuxt.hooks.callHook('schema:written')
     }

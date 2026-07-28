@@ -1,32 +1,49 @@
 import { existsSync } from 'node:fs'
-import * as vite from 'vite'
-import { dirname, join, normalize, resolve } from 'pathe'
+import type { IncomingMessage, ServerResponse } from 'node:http'
+import { performance } from 'node:perf_hooks'
+import { createBuilder, createServer, mergeConfig } from 'vite'
+import type * as vite from 'vite'
+import { basename, dirname, join, resolve } from 'pathe'
 import type { Nuxt, NuxtBuilder, ViteConfig } from '@nuxt/schema'
-import { addVitePlugin, createIsIgnored, logger, resolvePath, useNitro } from '@nuxt/kit'
-import replace from '@rollup/plugin-replace'
-import type { RollupReplaceOptions } from '@rollup/plugin-replace'
+import { createIsIgnored, getLayerDirectories, logger, resolvePath, useNitro } from '@nuxt/kit'
+import type { PreRenderedAsset } from 'rolldown'
 import { sanitizeFilePath } from 'mlly'
-import { withoutLeadingSlash } from 'ufo'
+import vuePlugin from '@vitejs/plugin-vue'
+import { joinURL, withTrailingSlash, withoutLeadingSlash } from 'ufo'
 import { filename } from 'pathe/utils'
-import { resolveTSConfig } from 'pkg-types'
 import { resolveModulePath } from 'exsolve'
 
-import { buildClient } from './client'
-import { buildServer } from './server'
-import { warmupViteServer } from './utils/warmup'
-import { resolveCSSOptions } from './css'
-import { logLevelMap } from './utils/logger'
-import { ssrStylesPlugin } from './plugins/ssr-styles'
-import { VitePublicDirsPlugin } from './plugins/public-dirs'
-import { distDir } from './dirs'
+import { ssr, ssrEnvironment } from './shared/server.ts'
+import { clientEnvironment } from './shared/client.ts'
+import { resolveCSSOptions } from './css.ts'
+import { createViteLogger, logLevelMap } from './utils/logger.ts'
+import { OptimizeDepsHintPlugin, optimizerCallbacks, userOptimizeDepsInclude } from './plugins/optimize-deps-hint.ts'
 
-export interface ViteBuildContext {
-  nuxt: Nuxt
-  config: ViteConfig
-  entry: string
-  clientServer?: vite.ViteDevServer
-  ssrServer?: vite.ViteDevServer
-}
+import { VueJsxPlugin } from './plugins/vue-jsx.ts'
+import { SSRStylesPlugin } from './plugins/ssr-styles.ts'
+import { PublicDirsPlugin } from './plugins/public-dirs.ts'
+import { ReplacePlugin } from './plugins/replace.ts'
+import { LayerDepOptimizePlugin } from './plugins/layer-dep-optimize.ts'
+import { distDir } from './dirs.ts'
+import { SourcemapPreserverPlugin } from './plugins/sourcemap-preserver.ts'
+import { DevStyleSSRPlugin } from './plugins/dev-style-ssr.ts'
+import { DecoratorsPlugin } from './plugins/decorators.ts'
+import { RuntimePathsPlugin } from './plugins/runtime-paths.ts'
+import { TypeCheckPlugin } from './plugins/type-check.ts'
+import { ModulePreloadPolyfillPlugin } from './plugins/module-preload-polyfill.ts'
+import { StableEntryPlugin } from './plugins/stable-entry.ts'
+import { VitePluginCheckerPlugin } from './plugins/vite-plugin-checker.ts'
+import { AnalyzePlugin } from './plugins/analyze.ts'
+import { DevServerPlugin } from './plugins/dev-server.ts'
+import { TemplateHMRPlugin } from './plugins/template-hmr.ts'
+import { EnvironmentsPlugin } from './plugins/environments.ts'
+import { ViteNodePlugin } from './plugins/vite-node.ts'
+import { ServerEntryPlugin } from './plugins/server-entry.ts'
+import { ClientManifestPlugin } from './plugins/client-manifest.ts'
+import { ResolveDeepImportsPlugin } from './plugins/resolve-deep-imports.ts'
+import { ResolveExternalsPlugin } from './plugins/resolved-externals.ts'
+import { PerfPlugin } from './plugins/perf.ts'
+import { isNavigationRequest, warmupViteServer } from './utils/warmup.ts'
 
 export const bundle: NuxtBuilder['bundle'] = async (nuxt) => {
   const useAsyncEntry = nuxt.options.experimental.asyncEntry || nuxt.options.dev
@@ -34,11 +51,20 @@ export const bundle: NuxtBuilder['bundle'] = async (nuxt) => {
 
   nuxt.options.modulesDir.push(distDir)
 
+  // Register Nitro plugin to fix SSR error stacktraces in dev mode
+  if (nuxt.options.dev) {
+    const nitro = useNitro()
+    nitro.options.virtual['#internal/nitro/ssr-stacktrace'] = `export { default } from ${JSON.stringify(resolve(distDir, 'fix-stacktrace'))}`
+    nitro.options.plugins.push('#internal/nitro/ssr-stacktrace')
+    nitro.options.alias['#vite-node'] = resolve(distDir, 'vite-node')
+    nitro.options.virtual['#internal/nuxt/vite-node-runner.mjs'] = () => `export { default } from ${JSON.stringify(resolve(distDir, 'vite-node-runner'))}`
+  }
+
   let allowDirs = [
     nuxt.options.appDir,
     nuxt.options.workspaceDir,
     ...nuxt.options.modulesDir,
-    ...nuxt.options._layers.map(l => l.config.rootDir),
+    ...getLayerDirectories(nuxt).map(d => d.root),
     ...Object.values(nuxt.apps).flatMap(app => [
       ...app.components.map(c => dirname(c.filePath)),
       ...app.plugins.map(p => dirname(p.src)),
@@ -49,203 +75,286 @@ export const bundle: NuxtBuilder['bundle'] = async (nuxt) => {
     ]),
   ].filter(d => d && existsSync(d))
 
-  for (const dir of allowDirs) {
-    allowDirs = allowDirs.filter(d => !d.startsWith(dir) || d === dir)
-  }
+  allowDirs = allowDirs.filter(d =>
+    !allowDirs.some(other => other !== d && d.startsWith(other + '/')),
+  )
 
   const { $client, $server, ...viteConfig } = nuxt.options.vite
 
   const mockEmpty = resolveModulePath('mocked-exports/empty', { from: import.meta.url })
 
+  const helper = nuxt.options.nitro.imports !== false ? '' : 'globalThis.'
+
   const isIgnored = createIsIgnored(nuxt)
-  const ctx: ViteBuildContext = {
-    nuxt,
-    entry,
-    config: vite.mergeConfig(
-      {
-        logLevel: logLevelMap[nuxt.options.logLevel] ?? logLevelMap.info,
-        resolve: {
-          alias: {
-            ...nuxt.options.alias,
-            '#app': nuxt.options.appDir,
-            'web-streams-polyfill/ponyfill/es2018': mockEmpty,
-            // Cannot destructure property 'AbortController' of ..
-            'abort-controller': mockEmpty,
-          },
-          dedupe: [
-            'vue',
-          ],
+  const serverEntry = nuxt.options.ssr ? entry : await resolvePath(resolve(nuxt.options.appDir, 'entry-spa'))
+
+  // https://github.com/vitejs/vite/blob/main/packages/vite/src/node/build.ts#L464-L478
+  const assetFileNames = nuxt.options.dev
+    ? undefined
+    : (chunk: PreRenderedAsset) => withoutLeadingSlash(join(nuxt.options.app.buildAssetsDir, `${sanitizeFilePath(filename(chunk.names[0]!))}.[hash].[ext]`))
+
+  const config: vite.InlineConfig = mergeConfig(
+    {
+      base: nuxt.options.dev
+        ? joinURL(nuxt.options.app.baseURL.replace(/^\.\//, '/') || '/', nuxt.options.app.buildAssetsDir)
+        : undefined,
+      logLevel: logLevelMap[nuxt.options.logLevel] ?? logLevelMap.info,
+      experimental: {
+        renderBuiltUrl: (filename, { type, hostType, ssr }) => {
+          if (hostType !== 'js') {
+            // In CSS we only use relative paths until we craft a clever runtime CSS hack
+            return { relative: true }
+          }
+          if (!ssr) {
+            if (type === 'asset') {
+              return { relative: true }
+            }
+            return { runtime: `globalThis.__publicAssetsURL(${JSON.stringify(filename)})` }
+          }
+          if (type === 'public') {
+            return { runtime: `${helper}__publicAssetsURL(${JSON.stringify(filename)})` }
+          }
+          if (type === 'asset') {
+            const relativeFilename = filename.replace(withTrailingSlash(withoutLeadingSlash(nuxt.options.app.buildAssetsDir)), '')
+            return { runtime: `${helper}__buildAssetsURL(${JSON.stringify(relativeFilename)})` }
+          }
         },
-        css: await resolveCSSOptions(nuxt),
-        define: {
-          __NUXT_VERSION__: JSON.stringify(nuxt._version),
-          __NUXT_ASYNC_CONTEXT__: nuxt.options.experimental.asyncContext,
-        },
-        build: {
-          copyPublicDir: false,
-          rollupOptions: {
-            output: {
-              sourcemapIgnoreList: (relativeSourcePath) => {
-                return relativeSourcePath.includes('node_modules') || relativeSourcePath.includes(ctx.nuxt.options.buildDir)
+      },
+      // `nitro/vite`'s plugin runs the build process, including prerendering + asset copying
+      ...nuxt.options.experimental.nitroViteEnvironment
+        ? {}
+        : {
+            builder: {
+              async buildApp (builder) {
+                // run serially to preserve the order of client, server builds
+                const environments = Object.values(builder.environments)
+                for (const environment of environments) {
+                  logger.restoreAll()
+                  nuxt._perf?.startPhase(`vite:${environment.name}`)
+                  await builder.build(environment)
+                  nuxt._perf?.endPhase(`vite:${environment.name}`)
+                  logger.wrapAll()
+                  await nuxt.callHook('vite:compiled')
+                }
               },
-              sanitizeFileName: sanitizeFilePath,
-              // https://github.com/vitejs/vite/tree/main/packages/vite/src/node/build.ts#L464-L478
-              assetFileNames: nuxt.options.dev
-                ? undefined
-                : chunk => withoutLeadingSlash(join(nuxt.options.app.buildAssetsDir, `${sanitizeFilePath(filename(chunk.names[0]!))}.[hash].[ext]`)),
             },
           },
-          watch: {
-            chokidar: { ...nuxt.options.watchers.chokidar, ignored: [isIgnored, /[\\/]node_modules[\\/]/] },
-            exclude: nuxt.options.ignore,
+      environments: {
+        client: {
+          consumer: 'client',
+          keepProcessEnv: false,
+          dev: {
+            warmup: warmupEntries(nuxt, entry),
           },
+          ...clientEnvironment(nuxt, entry),
         },
-        plugins: [
-          // add resolver for files in public assets directories
-          VitePublicDirsPlugin.vite({
-            dev: nuxt.options.dev,
-            sourcemap: !!nuxt.options.sourcemap.server,
-            baseURL: nuxt.options.app.baseURL,
-          }),
-          replace({ preventAssignment: true, ...globalThisReplacements }),
+        ssr: {
+          consumer: 'server',
+          dev: {
+            warmup: warmupEntries(nuxt, serverEntry),
+          },
+          ...ssrEnvironment(nuxt, serverEntry),
+        },
+      },
+      ssr: ssr(nuxt),
+      resolve: {
+        alias: {
+          [basename(nuxt.options.dir.assets)]: resolve(nuxt.options.srcDir, nuxt.options.dir.assets),
+          ...nuxt.options.alias,
+          '#app': nuxt.options.appDir,
+          'web-streams-polyfill/ponyfill/es2018': mockEmpty,
+          // Cannot destructure property 'AbortController' of ..
+          'abort-controller': mockEmpty,
+        },
+        dedupe: [
+          'vue',
         ],
-        server: {
-          watch: { ...nuxt.options.watchers.chokidar, ignored: [isIgnored, /[\\/]node_modules[\\/]/] },
-          fs: {
-            allow: [...new Set(allowDirs)],
+      },
+      // TODO: devSourcemap
+      css: await resolveCSSOptions(nuxt),
+      define: {
+        __NUXT_VERSION__: JSON.stringify(nuxt._version),
+        __NUXT_ASYNC_CONTEXT__: nuxt.options.experimental.asyncContext,
+      },
+      build: {
+        copyPublicDir: false,
+        rolldownOptions: {
+          output: {
+            sourcemapIgnoreList: (relativeSourcePath) => {
+              return relativeSourcePath.includes('node_modules') || relativeSourcePath.includes(nuxt.options.buildDir)
+            },
+            sanitizeFileName: sanitizeFilePath,
+            assetFileNames,
           },
         },
-      } satisfies ViteConfig,
-      viteConfig,
-    ),
-  }
+
+        // TODO: https://github.com/rolldown/rolldown/issues/5799 for ignored fn
+        watch: { exclude: [...nuxt.options.ignore, /[\\/]node_modules[\\/]/] },
+      },
+      worker: {
+        rolldownOptions: {
+          output: {
+            // matching the main build ensures assets shared with workers are emitted only once
+            assetFileNames,
+            sanitizeFileName: sanitizeFilePath,
+          },
+        },
+      },
+      plugins: [
+        // per-plugin timing when profiling is enabled
+        PerfPlugin(nuxt),
+        // add resolver for modules used in virtual files
+        ResolveDeepImportsPlugin(nuxt),
+        ResolveExternalsPlugin(nuxt),
+        vuePlugin(viteConfig.vue),
+        ...VueJsxPlugin(nuxt, viteConfig.vueJsx),
+        ClientManifestPlugin(nuxt),
+        // After ClientManifestPlugin so its dev `clientManifest` override wins.
+        ViteNodePlugin(nuxt),
+        ServerEntryPlugin(nuxt, entry),
+        DevServerPlugin(nuxt),
+        TemplateHMRPlugin(nuxt),
+        // lower decorators after Vue SFC compilation and TypeScript stripping
+        DecoratorsPlugin(nuxt),
+        // add resolver for files in public assets directories
+        PublicDirsPlugin({
+          dev: nuxt.options.dev,
+          baseURL: nuxt.options.app.baseURL,
+        }),
+        ReplacePlugin(),
+        LayerDepOptimizePlugin(nuxt),
+        SSRStylesPlugin(nuxt),
+        EnvironmentsPlugin(nuxt),
+        // Add type-checking
+        VitePluginCheckerPlugin(nuxt),
+        // tell rollup's nitro build about the original sources of the generated vite server build
+        SourcemapPreserverPlugin(nuxt),
+        // client-only plugins
+        DevStyleSSRPlugin({
+          srcDir: nuxt.options.srcDir,
+          buildAssetsURL: joinURL(nuxt.options.app.baseURL, nuxt.options.app.buildAssetsDir),
+        }),
+        RuntimePathsPlugin(),
+        // Type checking client panel
+        TypeCheckPlugin(nuxt),
+        ModulePreloadPolyfillPlugin(),
+        // ensure changes in chunks do not invalidate whole build
+        StableEntryPlugin(nuxt),
+        AnalyzePlugin(nuxt),
+        OptimizeDepsHintPlugin(nuxt),
+      ],
+      appType: 'custom',
+      server: {
+        middlewareMode: true,
+        watch: { ...nuxt.options.watchers.chokidar, ignored: [isIgnored, /[\\/]node_modules[\\/]/] },
+        fs: {
+          allow: [...new Set(allowDirs)],
+        },
+      },
+    } satisfies ViteConfig,
+    {
+      ...viteConfig,
+      environments: {
+        ssr: $server,
+        client: $client,
+      },
+    },
+  )
 
   // In build mode we explicitly override any vite options that vite is relying on
   // to detect whether to inject production or development code (such as HMR code)
   if (!nuxt.options.dev) {
-    ctx.config.server!.watch = undefined
-    ctx.config.build!.watch = undefined
+    config.server!.watch = undefined
+    config.build!.watch = undefined
   }
 
-  // TODO: this may no longer be needed with most recent vite version
-  if (nuxt.options.dev) {
-    // Identify which layers will need to have an extra resolve step.
-    const layerDirs: string[] = []
-    const delimitedRootDir = nuxt.options.rootDir + '/'
-    for (const layer of nuxt.options._layers) {
-      if (layer.config.srcDir !== nuxt.options.srcDir && !layer.config.srcDir.startsWith(delimitedRootDir)) {
-        layerDirs.push(layer.config.srcDir + '/')
-      }
-    }
-    if (layerDirs.length > 0) {
-      // Reverse so longest/most specific directories are searched first
-      layerDirs.sort().reverse()
-      ctx.nuxt.hook('vite:extendConfig', (config) => {
-        const dirs = [...layerDirs]
-        config.plugins!.push({
-          name: 'nuxt:optimize-layer-deps',
-          enforce: 'pre',
-          async resolveId (source, _importer) {
-            if (!_importer || !dirs.length) { return }
-            const importer = normalize(_importer)
-            const layerIndex = dirs.findIndex(dir => importer.startsWith(dir))
-            // Trigger vite to optimize dependencies imported within a layer, just as if they were imported in final project
-            if (layerIndex !== -1) {
-              dirs.splice(layerIndex, 1)
-              await this.resolve(source, join(nuxt.options.srcDir, 'index.html'), { skipSelf: true }).catch(() => null)
-            }
-          },
-        })
-      })
-    }
-  }
+  userOptimizeDepsInclude.set(nuxt, [...((config.optimizeDeps?.include as string[]) || [])])
 
-  // Add type-checking
-  if (!ctx.nuxt.options.test && (ctx.nuxt.options.typescript.typeCheck === true || (ctx.nuxt.options.typescript.typeCheck === 'build' && !ctx.nuxt.options.dev))) {
-    const checker = await import('vite-plugin-checker').then(r => r.default)
-    addVitePlugin(checker({
-      vueTsc: {
-        tsconfigPath: await resolveTSConfig(ctx.nuxt.options.rootDir),
-      },
-    }), { server: nuxt.options.ssr })
-  }
-
+  const ctx = { nuxt, entry, config: config as ViteConfig }
   await nuxt.callHook('vite:extend', ctx)
 
-  nuxt.hook('vite:extendConfig', (config) => {
-    const replaceOptions: RollupReplaceOptions = Object.create(null)
-    replaceOptions.preventAssignment = true
+  const callbacks = optimizerCallbacks.get(nuxt)
+  config.customLogger = createViteLogger(config, { onNewDeps: callbacks?.onNewDeps, onStaleDep: callbacks?.onStaleDep })
+  config.configFile = false
 
-    for (const key in config.define!) {
-      if (key.startsWith('import.meta.')) {
-        replaceOptions[key] = config.define![key]
-      }
-    }
-
-    config.plugins!.push(replace(replaceOptions))
-  })
-
-  if (!ctx.nuxt.options.dev) {
-    const chunksWithInlinedCSS = new Set<string>()
-    const clientCSSMap = {}
-
-    nuxt.hook('vite:extendConfig', (config, { isServer }) => {
-      config.plugins!.unshift(ssrStylesPlugin({
-        srcDir: ctx.nuxt.options.srcDir,
-        clientCSSMap,
-        chunksWithInlinedCSS,
-        shouldInline: ctx.nuxt.options.features.inlineStyles,
-        components: ctx.nuxt.apps.default!.components || [],
-        globalCSS: ctx.nuxt.options.css,
-        mode: isServer ? 'server' : 'client',
-        entry: ctx.entry,
-      }))
-    })
-
-    // Remove CSS entries for files that will have inlined styles
-    ctx.nuxt.hook('build:manifest', (manifest) => {
-      for (const [key, entry] of Object.entries(manifest)) {
-        const shouldRemoveCSS = chunksWithInlinedCSS.has(key) && !entry.isEntry
-        if (entry.isEntry && chunksWithInlinedCSS.has(key)) {
-          // @ts-expect-error internal key
-          entry._globalCSS = true
-        }
-        if (shouldRemoveCSS && entry.css) {
-          entry.css = []
-        }
-      }
-    })
+  for (const environment of ['client', 'ssr']) {
+    const environments = { [environment]: config.environments![environment]! }
+    const strippedConfig = { ...config, environments } as ViteConfig
+    const ctx = { isServer: environment === 'ssr', isClient: environment === 'client' }
+    await nuxt.hooks.callHook('vite:extendConfig', strippedConfig, ctx)
+    await nuxt.hooks.callHook('vite:configResolved', strippedConfig, ctx)
   }
 
-  nuxt.hook('vite:serverCreated', (server: vite.ViteDevServer, env) => {
-    // Invalidate virtual modules when templates are re-generated
-    ctx.nuxt.hook('app:templatesGenerated', async (_app, changedTemplates) => {
-      await Promise.all(changedTemplates.map(async (template) => {
-        for (const mod of server.moduleGraph.getModulesByFile(`virtual:nuxt:${encodeURIComponent(template.dst)}`) || []) {
-          server.moduleGraph.invalidateModule(mod)
-          await server.reloadModule(mod)
-        }
-      }))
-    })
+  if (!nuxt.options.dev) {
+    const builder = await createBuilder(config)
+    await builder.buildApp()
+    return
+  }
 
-    if (nuxt.options.vite.warmupEntry !== false) {
-      // Don't delay nitro build for warmup
-      useNitro().hooks.hookOnce('compiled', () => {
-        const start = Date.now()
-        warmupViteServer(server, [ctx.entry], env.isServer)
-          .then(() => logger.info(`Vite ${env.isClient ? 'client' : 'server'} warmed up in ${Date.now() - start}ms`))
-          .catch(logger.error)
-      })
-    }
-  })
-
-  await withLogs(() => buildClient(ctx), 'Vite client built', ctx.nuxt.options.dev)
-  await withLogs(() => buildServer(ctx), 'Vite server built', ctx.nuxt.options.dev)
+  nuxt._perf?.startPhase('vite:dev-server')
+  await withLogs(async () => {
+    const server = await createServer(config)
+    nuxt.hook('close', () => server.close())
+    await server.environments.ssr.pluginContainer.buildStart({})
+    startClientWarmup(nuxt, server, entry)
+  }, 'Vite dev server built')
+  nuxt._perf?.endPhase('vite:dev-server')
 }
 
-const globalThisReplacements = Object.fromEntries([';', '(', '{', '}', ' ', '\t', '\n'].map(d => [`${d}global.`, `${d}globalThis.`]))
+const WARMUP_MAX_MODULES = 5000
+const WARMUP_MAX_DURATION = 20_000
 
-async function withLogs (fn: () => Promise<void>, message: string, enabled = true) {
+function warmupEntries (nuxt: Nuxt, entry: string) {
+  return nuxt.options.vite.warmupEntry === false ? [] : [entry]
+}
+
+function startClientWarmup (nuxt: Nuxt, server: vite.ViteDevServer, entry: string) {
+  if (nuxt.options.test || nuxt.options.vite.warmupEntry === false) { return }
+
+  let stop = false
+  let inFlight = 0
+  const observer = {
+    route: '',
+    handle: (req: IncomingMessage, res: ServerResponse, next: (err?: unknown) => void) => {
+      if (isNavigationRequest(req)) {
+        stop = true
+      } else {
+        inFlight++
+        res.on('close', () => { inFlight-- })
+      }
+      next()
+    },
+  } as (typeof server.middlewares.stack)[number]
+  server.middlewares.stack.unshift(observer)
+
+  nuxt.hook('close', () => { stop = true })
+
+  const run = async () => {
+    try {
+      const { modules, visited, duration, stopped } = await warmupViteServer(server.environments.client as vite.DevEnvironment, [entry], {
+        root: server.config.root,
+        base: server.config.base,
+        maxModules: WARMUP_MAX_MODULES,
+        maxDuration: WARMUP_MAX_DURATION,
+        shouldStop: () => stop,
+        shouldPause: () => inFlight > 0,
+      })
+      logger.debug(`Vite client warmed up ${modules} of ${visited} modules in ${Math.round(duration)}ms${stopped ? ' (abandoned)' : ''}`)
+    } catch (error) {
+      logger.debug('Vite client warmup failed with:', error)
+    } finally {
+      const index = server.middlewares.stack.indexOf(observer)
+      if (index !== -1) {
+        server.middlewares.stack.splice(index, 1)
+      }
+    }
+  }
+
+  // we hook to avoid blocking nitro's build, and do not await crawl so we don't block the dev server
+  useNitro().hooks.hookOnce('compiled', () => { void run() })
+}
+
+async function withLogs (fn: () => Promise<unknown>, message: string, enabled = true) {
   if (!enabled) { return fn() }
 
   const start = performance.now()

@@ -1,57 +1,52 @@
-import { runInNewContext } from 'node:vm'
 import type { NuxtPage } from '@nuxt/schema'
 import type { NitroRouteConfig } from 'nitro/types'
-import { normalize } from 'pathe'
 
-import { getLoader } from '../core/utils'
-import { parseAndWalk } from '../core/utils/parse'
-import { extractScriptContent, pathToNitroGlob } from './utils'
+import { pageDiagnostics } from '@nuxt/kit'
+import { isEqual } from 'ohash'
+import { vueRouterToRou3 } from 'unrouting'
 
-const ROUTE_RULE_RE = /\bdefineRouteRules\(/
-const ruleCache: Record<string, NitroRouteConfig | null> = {}
-
-export function extractRouteRules (code: string, path: string): NitroRouteConfig | null {
-  if (code in ruleCache) {
-    return ruleCache[code] || null
-  }
-  if (!ROUTE_RULE_RE.test(code)) { return null }
-
-  let rule: NitroRouteConfig | null = null
-  const loader = getLoader(path)
-  if (!loader) { return null }
-
-  const contents = loader === 'vue' ? extractScriptContent(code) : [{ code, loader }]
-  for (const script of contents) {
-    if (rule) { break }
-
-    code = script?.code || code
-
-    parseAndWalk(code, 'file.' + (script?.loader || 'ts'), (node) => {
-      if (node.type !== 'CallExpression' || node.callee.type !== 'Identifier') { return }
-      if (node.callee.name === 'defineRouteRules') {
-        const rulesString = code.slice(node.start, node.end)
-        try {
-          rule = JSON.parse(runInNewContext(rulesString.replace('defineRouteRules', 'JSON.stringify'), {}))
-        } catch {
-          throw new Error('[nuxt] Error parsing route rules. They should be JSON-serializable.')
-        }
-      }
-    })
-  }
-
-  ruleCache[code] = rule
-  return rule
+export function globRouteRulesFromPages (pages: NuxtPage[]) {
+  return collectRouteRulesFromPages(pages, {}, '')
 }
 
-export function getMappedPages (pages: NuxtPage[], paths = {} as { [absolutePath: string]: string | null }, prefix = '') {
+function collectRouteRulesFromPages (
+  pages: NuxtPage[],
+  paths: Record<string, NitroRouteConfig>,
+  prefix: string,
+) {
   for (const page of pages) {
-    if (page.file) {
-      const filename = normalize(page.file)
-      paths[filename] = pathToNitroGlob(prefix + page.path)
+    if (page.rules) {
+      if (Object.keys(page.rules).length) {
+        const path = prefix + page.path
+        const { patterns, issues } = vueRouterToRou3(path, { collapse: true })
+        if (issues.length) {
+          for (const issue of issues) {
+            pageDiagnostics.NUXT_B4016({ path, detail: issue.message })
+          }
+        } else {
+          for (const pattern of patterns) {
+            if (pattern in paths && !isEqual(paths[pattern], page.rules)) {
+              pageDiagnostics.NUXT_B4017({ path, pattern })
+            }
+            paths[pattern] = page.rules
+          }
+        }
+      }
+      // remove rules to prevent exposing in build
+      delete page.rules
     }
-    if (page.children) {
-      getMappedPages(page.children, paths, page.path + '/')
+    if (page.children?.length) {
+      collectRouteRulesFromPages(page.children, paths, prefix + page.path + '/')
     }
   }
   return paths
+}
+
+export function removePagesRules (routes: NuxtPage[]) {
+  for (const route of routes) {
+    delete route.rules
+    if (route.children?.length) {
+      removePagesRules(route.children)
+    }
+  }
 }

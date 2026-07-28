@@ -1,21 +1,52 @@
-import { cloneVNode, createElementBlock, defineComponent, getCurrentInstance, h, onMounted, provide, ref } from 'vue'
-import type { ComponentInternalInstance, ComponentOptions, InjectionKey } from 'vue'
+import { cloneVNode, createCommentVNode, createElementBlock, defineComponent, getCurrentInstance, h, onMounted, provide, shallowRef } from 'vue'
+import type { Component, ComponentInternalInstance, ComponentOptions, DefineSetupFnComponent, InjectionKey, RendererNode, SlotsType, VNode } from 'vue'
 import { isPromise } from '@vue/shared'
 import { useNuxtApp } from '../nuxt'
 import ServerPlaceholder from './server-placeholder'
-import { elToStaticVNode } from './utils'
+import { elToStaticVNode, sanitizeTag } from './utils'
+
+import { clientNodePlaceholder } from '#build/nuxt.config.mjs'
 
 export const clientOnlySymbol: InjectionKey<boolean> = Symbol.for('nuxt:client-only')
 
 const STATIC_DIV = '<div></div>'
 
-export default defineComponent({
+function isPlaceholderComment (el: RendererNode) {
+  return el.nodeName === '#comment' && el.nodeValue === 'placeholder'
+}
+
+function createPlaceholder (el?: RendererNode | null) {
+  if (el && !isPlaceholderComment(el)) {
+    return elToStaticVNode(el, STATIC_DIV)
+  }
+  return clientNodePlaceholder ? createCommentVNode('placeholder') : h('div')
+}
+
+interface ClientOnlyProps {
+  fallback?: string
+  placeholder?: string
+  placeholderTag?: string
+  fallbackTag?: string
+}
+
+type ClientOnlySlots = SlotsType<{
+  default?: () => VNode[]
+  /**
+   * Specify a content to be rendered on the server and displayed until `<ClientOnly>` is mounted in the browser.
+   */
+  fallback?: () => VNode[]
+  placeholder?: () => VNode[]
+}>
+
+const ClientOnly = defineComponent({
   name: 'ClientOnly',
   inheritAttrs: false,
-
   props: ['fallback', 'placeholder', 'placeholderTag', 'fallbackTag'],
+  ...(import.meta.dev && {
+    slots: Object as ClientOnlySlots,
+  }),
   setup (props, { slots, attrs }) {
-    const mounted = ref(false)
+    const mounted = shallowRef(false)
     onMounted(() => { mounted.value = true })
     // Bail out of checking for pages/layouts as they might be included under `<ClientOnly>` 🤷‍♂️
     if (import.meta.dev) {
@@ -29,20 +60,28 @@ export default defineComponent({
     }
     provide(clientOnlySymbol, true)
     return () => {
-      if (mounted.value) { return slots.default?.() }
+      if (mounted.value) {
+        const vnodes = slots.default?.()
+        if (vnodes && vnodes.length === 1) {
+          return [cloneVNode(vnodes[0]!, attrs)]
+        }
+        return vnodes
+      }
       const slot = slots.fallback || slots.placeholder
       if (slot) { return h(slot) }
       const fallbackStr = props.fallback || props.placeholder || ''
-      const fallbackTag = props.fallbackTag || props.placeholderTag || 'span'
+      const fallbackTag = sanitizeTag(props.fallbackTag || props.placeholderTag, 'span')
       return createElementBlock(fallbackTag, attrs, fallbackStr)
     }
   },
-})
+}) as unknown as DefineSetupFnComponent<ClientOnlyProps, {}, ClientOnlySlots>
+
+export default ClientOnly
 
 const cache = new WeakMap()
 
 /* @__NO_SIDE_EFFECTS__ */
-export function createClientOnly<T extends ComponentOptions> (component: T) {
+export function createClientOnly<T extends ComponentOptions> (component: T): Component {
   if (import.meta.server) {
     return ServerPlaceholder
   }
@@ -61,19 +100,20 @@ export function createClientOnly<T extends ComponentOptions> (component: T) {
           ? cloneVNode(res)
           : h(res)
       }
-      return elToStaticVNode(ctx._.vnode.el, STATIC_DIV)
+      return createPlaceholder(ctx._.vnode.el)
     }
   } else {
     // handle runtime-compiler template
+    const placeholderTemplate = clientNodePlaceholder ? '<!--placeholder-->' : '<div></div>'
     clone.template &&= `
       <template v-if="mounted$">${component.template}</template>
-      <template v-else>${STATIC_DIV}</template>
+      <template v-else>${placeholderTemplate}</template>
     `
   }
 
   clone.setup = (props, ctx) => {
     const nuxtApp = useNuxtApp()
-    const mounted$ = ref(nuxtApp.isHydrating === false)
+    const mounted$ = shallowRef(nuxtApp.isHydrating === false)
     const instance = getCurrentInstance()!
 
     if (nuxtApp.isHydrating) {
@@ -110,16 +150,21 @@ export function createClientOnly<T extends ComponentOptions> (component: T) {
               ? cloneVNode(res)
               : h(res)
           }
-          return elToStaticVNode(instance?.vnode.el, STATIC_DIV)
+          return createPlaceholder(instance?.vnode.el)
         }
       })
     } else {
       if (typeof setupState === 'function') {
         return (...args: any[]) => {
           if (mounted$.value) {
-            return h(setupState(...args), ctx.attrs)
+            const res = setupState(...args)
+            const attrs = clone.inheritAttrs !== false ? ctx.attrs : undefined
+
+            return (res.children === null || typeof res.children === 'string')
+              ? cloneVNode(res, attrs)
+              : h(res, attrs)
           }
-          return elToStaticVNode(instance?.vnode.el, STATIC_DIV)
+          return createPlaceholder(instance?.vnode.el)
         }
       }
       return Object.assign(setupState, { mounted$ })

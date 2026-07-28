@@ -1,19 +1,27 @@
 import { defineComponent, h, nextTick, onMounted, provide, shallowReactive } from 'vue'
-import type { Ref, VNode } from 'vue'
+import type { DefineSetupFnComponent, Ref, VNode } from 'vue'
 import type { RouteLocationNormalizedLoaded } from 'vue-router'
+import { renderDiagnostics } from '../diagnostics/render'
 import { PageRouteSymbol } from './injections'
 
-export const defineRouteProvider = (name = 'RouteProvider') => defineComponent({
+interface RouteProviderProps {
+  route: RouteLocationNormalizedLoaded
+  vnode?: VNode
+  vnodeRef?: Ref<any>
+  renderKey?: string
+  trackRootNodes?: boolean
+}
+
+export type RouteProviderComponent = DefineSetupFnComponent<RouteProviderProps>
+
+export const defineRouteProvider = (name = 'RouteProvider'): RouteProviderComponent => defineComponent({
   name,
   props: {
-    vnode: {
-      type: Object as () => VNode,
-      required: true,
-    },
     route: {
       type: Object as () => RouteLocationNormalizedLoaded,
       required: true,
     },
+    vnode: Object as () => VNode,
     vnodeRef: Object as () => Ref<any>,
     renderKey: String,
     trackRootNodes: Boolean,
@@ -39,14 +47,17 @@ export const defineRouteProvider = (name = 'RouteProvider') => defineComponent({
       onMounted(() => {
         nextTick(() => {
           if (['#comment', '#text'].includes(vnode?.el?.nodeName)) {
-            const filename = (vnode?.type as any).__file
-            console.warn(`[nuxt] \`${filename}\` does not have a single root node and will cause errors when navigating between routes.`)
+            const filename = (vnode?.type as any)?.__file
+            renderDiagnostics.NUXT_E4004({ filename })
           }
         })
       })
     }
 
     return () => {
+      if (!props.vnode) {
+        return props.vnode
+      }
       if (import.meta.dev && import.meta.client) {
         vnode = h(props.vnode, { ref: props.vnodeRef })
         return vnode
@@ -55,6 +66,6 @@ export const defineRouteProvider = (name = 'RouteProvider') => defineComponent({
       return h(props.vnode, { ref: props.vnodeRef })
     }
   },
-})
+}) as unknown as RouteProviderComponent
 
-export const RouteProvider = defineRouteProvider()
+export const RouteProvider: RouteProviderComponent = defineRouteProvider()

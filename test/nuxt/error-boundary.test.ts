@@ -1,8 +1,9 @@
 /// <reference path="../fixtures/basic/.nuxt/nuxt.d.ts" />
 
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import { mount } from '@vue/test-utils'
+import type { ComponentSlots } from 'vue-component-type-helpers'
 import { NuxtErrorBoundary } from '#components'
 
 describe('NuxtErrorBoundary', () => {
@@ -21,6 +22,8 @@ describe('NuxtErrorBoundary', () => {
 
   it('should handle error state', async () => {
     let thrown = false
+    // suppress Vue warning: [Vue warn]: Component is missing template or render function:
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
     const el = mount({
       setup () {
         return () => h('div', {}, h(NuxtErrorBoundary, {}, {
@@ -34,7 +37,7 @@ describe('NuxtErrorBoundary', () => {
             },
           })),
           error: (
-            { error, clearError }: Parameters<InstanceType<typeof NuxtErrorBoundary>['$slots']['error']>[0],
+            { error, clearError }: Parameters<ComponentSlots<typeof NuxtErrorBoundary>['error']>[0],
           ) => h('button', { onClick: () => clearError() }, error.toString()),
         }))
       },
@@ -44,5 +47,6 @@ describe('NuxtErrorBoundary', () => {
     await el.find('button').trigger('click')
     expect(el.html()).toMatchInlineSnapshot(`"<div><span>default</span></div>"`)
     el.unmount()
+    vi.resetAllMocks()
   })
 })

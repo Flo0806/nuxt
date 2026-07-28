@@ -38,7 +38,6 @@ export interface ImportGlobOptions<
   as?: AsType
   /**
    * Import as static or dynamic
-   * @default false
    */
   eager?: Eager
   /**
@@ -51,7 +50,6 @@ export interface ImportGlobOptions<
   query?: string | Record<string, string | number | boolean>
   /**
    * Search files also inside `node_modules/` and hidden directories (e.g. `.git/`). This might have impact on performance.
-   * @default false
    */
   exhaustive?: boolean
 }
@@ -94,39 +92,10 @@ export interface ImportGlobFunction {
   ): Record<string, M>
 }
 
-export interface ImportGlobEagerFunction {
-  /**
-   * Eagerly import a list of files with a glob pattern.
-   *
-   * Overload 1: No generic provided, infer the type from `as`
-   */
-  <
-    As extends string,
-    T = As extends keyof KnownAsTypeMap ? KnownAsTypeMap[As] : unknown,
-  >(
-    glob: string | string[],
-    options?: Omit<ImportGlobOptions<boolean, As>, 'eager'>
-  ): Record<string, T>
-  /**
-   * Eagerly import a list of files with a glob pattern.
-   *
-   * Overload 2: Module generic provided
-   */
-  <M>(
-    glob: string | string[],
-    options?: Omit<ImportGlobOptions<boolean, string>, 'eager'>
-  ): Record<string, M>
-}
-
 export interface ViteImportMeta {
-  /** Vite client HMR API - see https://vite.dev/guide/api-hmr.html */
+  /** Vite client HMR API - see https://vite.dev/guide/api-hmr */
   readonly hot?: ViteHot
 
   /** vite glob import utility - https://vite.dev/guide/features.html#glob-import */
   glob: ImportGlobFunction
-
-  /**
-   * @deprecated Use `import.meta.glob('*', { eager: true })` instead
-   */
-  globEager: ImportGlobEagerFunction
 }
